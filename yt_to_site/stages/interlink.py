@@ -16,14 +16,13 @@ import time
 from pathlib import Path
 
 import numpy as np
-import requests
 
 from ..config import PipelineConfig
+from ..groq_client import chat
 from ..storage import JSONLStore, ProgressTracker
 from ..slug import generate_slug
 
 
-OPENROUTER_API = "https://openrouter.ai/api/v1/chat/completions"
 
 
 def _get_cohere_client():
@@ -151,22 +150,7 @@ Rules:
 Text:
 {text_chunk}"""
 
-    response = requests.post(
-        OPENROUTER_API,
-        headers={
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-        },
-        json={
-            "model": model,
-            "messages": [{"role": "user", "content": prompt}],
-            "temperature": 0.2,
-            "max_tokens": 16000,
-        },
-        timeout=120,
-    )
-    response.raise_for_status()
-    return response.json()["choices"][0]["message"]["content"].strip()
+    return chat([{"role": "user", "content": prompt}], model, api_key, max_tokens=2048, temperature=0.2)
 
 
 def run(config: PipelineConfig) -> dict:
@@ -174,10 +158,10 @@ def run(config: PipelineConfig) -> dict:
     print("\n  Interlink")
     print("  " + "─" * 38)
 
-    api_key = os.getenv("OPENROUTER_API_KEY")
+    api_key = os.getenv("GROQ_API_KEY")
     cohere_key = os.getenv("COHERE_API_KEY")
     if (not api_key or not cohere_key) and not config.dry_run:
-        print("  Error: OPENROUTER_API_KEY and COHERE_API_KEY required")
+        print("  Error: GROQ_API_KEY and COHERE_API_KEY required")
         return {"error": "missing API keys"}
 
     store = JSONLStore(config.data_dir)
@@ -206,7 +190,7 @@ def run(config: PipelineConfig) -> dict:
 
     # Phase 3: Process content
     total_linked = 0
-    model = config.interlink.rerank_model if hasattr(config.interlink, 'rerank_model') else "google/gemini-2.5-flash"
+    model = config.interlink.rerank_model if hasattr(config.interlink, 'rerank_model') else "llama-3.3-70b-versatile"
     # Use the SEO model for link insertion LLM calls
     llm_model = config.seo.model
 

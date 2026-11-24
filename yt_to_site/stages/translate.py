@@ -13,13 +13,12 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
-import requests
-
 from ..config import PipelineConfig
+from ..groq_client import chat, split_text
+from groq import APIStatusError
 from ..storage import JSONLStore, ProgressTracker
 
 
-OPENROUTER_API = "https://openrouter.ai/api/v1/chat/completions"
 
 TRANSLATABLE_FIELDS = ["title", "full_title", "description", "content", "summary"]
 
@@ -55,48 +54,27 @@ Rules:
 - Translate naturally, not word-for-word
 - Preserve markdown formatting (links, headings, bold, etc.)
 - Preserve proper nouns and technical terms as-is when appropriate
+- Do not invent hadith or Quran quotations. Do not produce translated Quran quotations; retain references only.
+- Copy every QURANPLACEHOLDER token exactly, once, unchanged, in the same order.
 - Return ONLY the translated text, no explanations
 
 Text:
 {text}"""
 
-    response = requests.post(
-        OPENROUTER_API,
-        headers={
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-        },
-        json={
-            "model": model,
-            "messages": [{"role": "user", "content": prompt}],
-            "temperature": 0.3,
-            "max_tokens": 16000,
-        },
-        timeout=180,
-    )
-    response.raise_for_status()
-    return response.json()["choices"][0]["message"]["content"].strip()
+    return chat([{"role": "user", "content": prompt}], model, api_key, max_tokens=2048)
 
 
 def _translate_with_retry(text: str, target_locale: str, model: str, fallback_model: str, api_key: str, max_retries: int = 3) -> str:
-    """Translate with retry and fallback model support."""
-    last_error = None
-    for attempt in range(max_retries):
-        current_model = fallback_model if attempt > 0 else model
+    """Use the configured model; shared Groq client handles rate-limit retries."""
+    parts = []
+    for chunk in split_text(text, 3000):
         try:
-            return _translate_text(text, target_locale, current_model, api_key)
-        except requests.exceptions.HTTPError as e:
-            last_error = e
-            if e.response.status_code == 429:
-                time.sleep((2 ** attempt) * 10)
-            elif e.response.status_code >= 500:
-                time.sleep((2 ** attempt) * 5)
-            else:
+            parts.append(_translate_text(chunk, target_locale, model, api_key))
+        except APIStatusError as exc:
+            if exc.status_code not in (400, 404) or fallback_model == model:
                 raise
-        except requests.exceptions.RequestException as e:
-            last_error = e
-            time.sleep((2 ** attempt) * 3)
-    raise last_error
+            parts.append(_translate_text(chunk, target_locale, fallback_model, api_key))
+    return "\n\n".join(parts)
 
 
 def _translate_entry(entry: dict, target_locale: str, model: str, fallback_model: str, api_key: str) -> dict:
@@ -105,35 +83,34 @@ def _translate_entry(entry: dict, target_locale: str, model: str, fallback_model
     for field in TRANSLATABLE_FIELDS:
         value = entry.get(field)
         if value and isinstance(value, str) and len(value) > 0:
-            try:
-                translated[field] = _translate_with_retry(value, target_locale, model, fallback_model, api_key)
-            except Exception:
-                pass  # keep original on failure
+            translated[field] = _translate_with_retry(value, target_locale, model, fallback_model, api_key)
     return translated
 
 
-def _translate_transcript_chunks(text: str, target_locale: str, model: str, fallback_model: str, api_key: str, max_chunk: int = 6000) -> str:
-    """Translate a transcript by splitting on headings and translating chunks."""
-    # Split by markdown headings
-    sections = re.split(r"(^##+ .+$)", text, flags=re.MULTILINE)
-
-    chunks: list[str] = []
-    current = ""
-    for section in sections:
-        if len(current) + len(section) > max_chunk and current:
-            chunks.append(current)
-            current = section
-        else:
-            current += section
-    if current:
-        chunks.append(current)
+def _translate_transcript_chunks(text: str, target_locale: str, model: str, fallback_model: str, api_key: str, max_chunk: int = 3000) -> str:
+    """Translate bounded chunks while protecting Quran text."""
+    # Protect verified Arabic from any change, including by the translation model.
+    pattern = re.compile(r'<quran\s+ref="\d+:\d+(?:-\d+)?"\s*>.*?</quran>', re.DOTALL)
+    verses = pattern.findall(text)
+    for i, verse in enumerate(verses):
+        text = text.replace(verse, f"QURANPLACEHOLDER{i}END", 1)
+    if re.search(r"</?quran\b", text, re.IGNORECASE):
+        raise ValueError("Malformed Quran markup")
+    chunks = split_text(text, max_chunk)
 
     translated_parts = []
     for chunk in chunks:
         translated = _translate_with_retry(chunk, target_locale, model, fallback_model, api_key)
         translated_parts.append(translated)
 
-    return "\n\n".join(translated_parts)
+    result = "\n\n".join(translated_parts)
+    tokens = re.findall(r"QURANPLACEHOLDER\d+END", result)
+    expected = [f"QURANPLACEHOLDER{i}END" for i in range(len(verses))]
+    if tokens != expected:
+        raise ValueError("Translation changed or omitted Quran placeholders")
+    for token, verse in zip(expected, verses):
+        result = result.replace(token, verse)
+    return result
 
 
 def run(config: PipelineConfig) -> dict:
@@ -141,13 +118,14 @@ def run(config: PipelineConfig) -> dict:
     print("\n  Translate")
     print("  " + "─" * 38)
 
-    api_key = os.getenv("OPENROUTER_API_KEY")
+    api_key = os.getenv("GROQ_API_KEY")
     if not api_key and not config.dry_run:
-        print("  Error: OPENROUTER_API_KEY required")
+        print("  Error: GROQ_API_KEY required")
         return {"error": "no API key"}
 
     store = JSONLStore(config.data_dir)
     total = 0
+    errors = 0
 
     for locale in config.translation.locales:
         print(f"\n  Locale: {locale} ({_get_locale_name(locale)})")
@@ -175,6 +153,7 @@ def run(config: PipelineConfig) -> dict:
                     progress.mark_done(entry["id"])
                     total += 1
                 except Exception as e:
+                    errors += 1
                     print(f"      Error translating {entry['id']}: {e}")
 
                 time.sleep(config.sleep)
@@ -201,8 +180,9 @@ def run(config: PipelineConfig) -> dict:
                         store.write_transcript(video_id, translated, locale=locale)
                         total += 1
                     except Exception as e:
+                        errors += 1
                         print(f"      Error translating transcript {video_id}: {e}")
                     time.sleep(config.sleep)
 
     print(f"\n  Translated: {total} items")
-    return {"translated": total}
+    return {"translated": total, **({"error": f"{errors} translations failed"} if errors else {})}

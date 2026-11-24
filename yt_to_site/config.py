@@ -12,17 +12,18 @@ from pydantic import BaseModel, Field
 class ChannelConfig(BaseModel):
     """YouTube channel configuration."""
 
-    handle: str  # e.g. "@mkbhd"
+    handle: str = ""  # optional legacy channel handle
+    playlist_id: str = "PLXS0usquloW_VC2gPb6nu1FFQTxWc1Ww_"
     source_language: str = "en"  # primary language of the channel
 
 
 class TranscriptionConfig(BaseModel):
     """Transcription stage configuration."""
 
-    format_model: str = "google/gemini-2.5-flash"
+    format_model: str = "llama-3.3-70b-versatile"
     parallel_workers: int = 6
-    poll_interval: int = 5
-    max_poll_attempts: int = 60
+    audio_fallback: bool = True  # use Groq Whisper if subtitles are missing
+    whisper_model: str = "whisper-large-v3"
     quran_validation: bool = False  # enable Quran verse correction (requires quran-validator)
 
 
@@ -30,8 +31,8 @@ class TranslationConfig(BaseModel):
     """Translation stage configuration."""
 
     locales: list[str] = Field(default_factory=lambda: ["en"])
-    model: str = "google/gemini-2.5-flash"
-    fallback_model: str = "google/gemini-2.5-pro"
+    model: str = "llama-3.3-70b-versatile"
+    fallback_model: str = "llama-3.3-70b-versatile"
     batch_size: int = 20
     parallel_workers: int = 5
 
@@ -39,7 +40,7 @@ class TranslationConfig(BaseModel):
 class SummarizationConfig(BaseModel):
     """Summarization stage configuration."""
 
-    model: str = "google/gemini-2.5-flash"
+    model: str = "llama-3.3-70b-versatile"
     max_tokens: int = 500
 
 
@@ -56,7 +57,7 @@ class InterlinkConfig(BaseModel):
 class SEOConfig(BaseModel):
     """SEO metadata generation configuration."""
 
-    model: str = "google/gemini-2.5-flash"
+    model: str = "llama-3.3-70b-versatile"
 
 
 class WebConfig(BaseModel):
@@ -84,8 +85,9 @@ class PipelineConfig(BaseModel):
     web: WebConfig = Field(default_factory=WebConfig)
 
     # Global settings
-    sleep: float = 1.0  # delay between API calls
+    sleep: float = 3.0  # minimum interval between Groq requests
     dry_run: bool = False
+    limit: int | None = Field(default=None, ge=1)
 
     @classmethod
     def from_yaml(cls, path: str | Path) -> PipelineConfig:
