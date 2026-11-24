@@ -1,13 +1,8 @@
-"""Fetch video metadata from a YouTube channel.
-
-Uses YouTube Data API v3 to get all videos from a channel's uploads playlist.
-New videos are appended to the JSONL store with auto-incrementing IDs.
-"""
+"""Fetch ordered playlist metadata using yt-dlp without an API key."""
 
 from __future__ import annotations
 
 import json
-import os
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -39,61 +34,57 @@ def _save_counter(data_dir: Path, next_id: int) -> None:
         json.dump({"next_id": next_id}, f)
 
 
-def fetch_channel_videos(channel_handle: str, api_key: str) -> list[dict]:
-    """Fetch all videos from a YouTube channel."""
-    from googleapiclient.discovery import build
+def fetch_playlist_videos(playlist_id: str, limit: int | None = None) -> list[dict]:
+    """Fetch playlist entries in the order returned by YouTube, never upload order."""
+    from yt_dlp import YoutubeDL
 
-    youtube = build("youtube", "v3", developerKey=api_key)
-
-    # Get channel's uploads playlist
-    ch_resp = youtube.channels().list(
-        forHandle=channel_handle,
-        part="contentDetails"
-    ).execute()
-
-    items = ch_resp.get("items", [])
-    if not items:
-        print(f"  Could not find channel for {channel_handle}", file=sys.stderr)
-        return []
-
-    uploads_playlist_id = items[0]["contentDetails"]["relatedPlaylists"]["uploads"]
-    print(f"  Uploads playlist: {uploads_playlist_id}")
-
-    videos = []
-    next_page = None
-    while True:
-        pl_resp = youtube.playlistItems().list(
-            playlistId=uploads_playlist_id,
-            part="snippet",
-            maxResults=50,
-            pageToken=next_page
-        ).execute()
-
-        for item in pl_resp.get("items", []):
-            snippet = item.get("snippet", {})
-            video_id = snippet.get("resourceId", {}).get("videoId")
-            if not video_id:
-                continue
-            videos.append({
-                "video_id": video_id,
-                "title": snippet.get("title", ""),
-                "description": snippet.get("description", ""),
-                "published_at": snippet.get("publishedAt", ""),
-                "thumbnails": snippet.get("thumbnails", {}),
-            })
-
-        next_page = pl_resp.get("nextPageToken")
-        if not next_page:
-            break
-
+    options = {"extract_flat": "in_playlist", "quiet": True, "no_warnings": True,
+               "ignoreerrors": False, "skip_download": True, "socket_timeout": 15, "retries": 1}
+    if limit is not None:
+        options["playlistend"] = limit
+    url = f"https://www.youtube.com/playlist?list={playlist_id}"
+    with YoutubeDL(options) as ydl:
+        info = ydl.extract_info(url, download=False)
+        if not info or info.get("_type") not in {"playlist", "multi_video"}:
+            raise ValueError("Could not retrieve the playlist")
+        videos = []
+        for index, item in enumerate(info.get("entries") or [], start=1):
+            if not item:
+                raise ValueError(f"Playlist item {index} is unavailable")
+            position = item.get("playlist_index")
+            if position is not None and position != index:
+                raise ValueError(f"Missing or out-of-order playlist item at position {index}")
+            video_id = item.get("id")
+            title = item.get("title") or ""
+            if (not video_id or not title or title.lower().strip("[]") in {"private video", "deleted video"}
+                    or item.get("availability") in {"private", "needs_auth", "subscriber_only", "premium_only"}):
+                raise ValueError(f"Playlist item {index} is unavailable")
+            upload_date = item.get("upload_date") or ""
+            try:
+                published = datetime.strptime(upload_date, "%Y%m%d").isoformat() if upload_date else ""
+            except ValueError:
+                published = ""
+            thumbnails = item.get("thumbnails") or []
+            thumbnail_url = item.get("thumbnail") or next(
+                (thumb.get("url") for thumb in reversed(thumbnails) if thumb.get("url")), None
+            )
+            videos.append({"video_id": video_id, "title": title,
+                           "description": item.get("description") or "",
+                           "published_at": published, "thumbnail_url": thumbnail_url,
+                           "position": index - 1})
+            if limit and index >= limit:
+                break
+    if not videos:
+        raise ValueError("Playlist is empty or inaccessible")
+    if len({v["video_id"] for v in videos}) != len(videos):
+        raise ValueError("Playlist contains duplicate videos; manual review required")
     return videos
 
 
 def map_to_schema(yt_item: dict, item_id: int, source_language: str) -> dict:
     """Map YouTube API item to the content schema."""
     published = yt_item["published_at"].replace("Z", "")
-    thumb = yt_item.get("thumbnails", {})
-    thumb_url = (thumb.get("maxres") or thumb.get("high") or thumb.get("medium") or {}).get("url")
+    thumb_url = yt_item.get("thumbnail_url")
 
     return {
         "id": item_id,
@@ -103,6 +94,8 @@ def map_to_schema(yt_item: dict, item_id: int, source_language: str) -> dict:
         "content": None,
         "content_type": "video",
         "youtube_id": yt_item["video_id"],
+        "youtube_url": f"https://www.youtube.com/watch?v={yt_item['video_id']}",
+        "episode_number": yt_item["position"] + 1,
         "thumbnail_url": thumb_url,
         "is_series": False,
         "is_active": True,
@@ -115,13 +108,9 @@ def map_to_schema(yt_item: dict, item_id: int, source_language: str) -> dict:
 
 
 def run(config: PipelineConfig) -> dict:
-    """Sync videos from YouTube channel into the JSONL store."""
-    api_key = os.getenv("YOUTUBE_API_KEY")
-    if not api_key:
-        print("\n  Skipped (no YOUTUBE_API_KEY)")
-        return {"skipped": True}
+    """Sync playlist videos into the JSONL store."""
 
-    print("\n  YouTube channel sync")
+    print("\n  YouTube playlist sync")
     print("  " + "─" * 38)
 
     store = JSONLStore(config.data_dir)
@@ -142,12 +131,24 @@ def run(config: PipelineConfig) -> dict:
 
     # Fetch from YouTube
     try:
-        channel_videos = fetch_channel_videos(config.channel.handle, api_key)
+        channel_videos = fetch_playlist_videos(config.channel.playlist_id, config.limit)
     except Exception as e:
-        print(f"  YouTube API error: {e}", file=sys.stderr)
+        print(f"  Playlist extraction error: {e}", file=sys.stderr)
         return {"error": str(e)}
 
-    print(f"  Videos on channel: {len(channel_videos)}")
+    print(f"  Videos selected from playlist: {len(channel_videos)}")
+
+    # Refuse mixed or stale datasets: downstream stages otherwise process extra lessons.
+    selected_ids = {v["video_id"] for v in channel_videos}
+    if existing_yt_ids - selected_ids:
+        raise ValueError("Data directory contains videos outside the selected playlist/limit; use a fresh data_dir")
+    # Keep episode numbers in sync even if the playlist is reordered.
+    positions = {v["video_id"]: v["position"] + 1 for v in channel_videos}
+    existing = store.read("videos")
+    for entry in existing:
+        entry["episode_number"] = positions[entry["youtube_id"].split("?")[0]]
+    if existing and not config.dry_run:
+        store.write("videos", sorted(existing, key=lambda e: e["episode_number"]))
 
     # Filter new only
     new_videos = [v for v in channel_videos if v["video_id"] not in existing_yt_ids]
@@ -174,6 +175,7 @@ def run(config: PipelineConfig) -> dict:
         next_id += 1
         count += 1
 
+    store.write("videos", sorted(store.read("videos"), key=lambda e: e["episode_number"]))
     _save_counter(data_dir, next_id)
     print(f"\n  Imported {count} videos (IDs {next_id - count}–{next_id - 1})")
     return {"imported": count}

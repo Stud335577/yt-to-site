@@ -1,49 +1,32 @@
-# yt-to-site pipeline configuration
-# Copy this to config.yaml and customize for your channel.
-
+# Copy to config.yaml. Use a fresh data directory for this playlist.
 channel:
-  handle: "@mkbhd"           # YouTube channel handle
-  source_language: en         # Primary language of the channel
+  playlist_id: "PLXS0usquloW_VC2gPb6nu1FFQTxWc1Ww_"
+  source_language: ar
 
-data_dir: data                # Where JSONL files and transcripts are stored
-
-content_types:
-  - videos                    # Content types to process
+data_dir: data
+content_types: [videos]
 
 transcription:
-  format_model: google/gemini-2.5-flash   # LLM for structuring raw transcripts into markdown
-  parallel_workers: 6
-  quran_validation: false                  # Set true for Islamic content (requires quran-validator)
+  format_model: llama-3.3-70b-versatile
+  parallel_workers: 1
+  quran_validation: true
+  audio_fallback: true        # Groq Whisper if Arabic subtitles are missing
+  whisper_model: whisper-large-v3
 
 translation:
-  locales:                    # Target languages (source language is excluded automatically)
-    - es
-    - fr
-  model: google/gemini-2.5-flash
-  fallback_model: google/gemini-2.5-pro
-  batch_size: 20
-  parallel_workers: 5
+  locales: [en, es, fr, id, ur]
+  model: llama-3.3-70b-versatile
+  fallback_model: llama-3.3-70b-versatile
 
 summarization:
-  model: google/gemini-2.5-flash
-
-interlink:
-  embed_model: embed-multilingual-v3.0
-  embed_batch_size: 96
-  min_similarity: 0.3
-  max_links_per_chunk: 3
-
+  model: llama-3.3-70b-versatile
 seo:
-  model: google/gemini-2.5-flash
+  model: llama-3.3-70b-versatile
 
 web:
-  site_name: "MKBHD Archive"
-  site_description: "Every MKBHD video, transcribed, translated, and interlinked"
-  default_locale: en
-  supported_locales:
-    - en
-    - es
-    - fr
-  domain: mkbhd-archive.example.com
+  site_name: "Forty Hadith | A Waqf Project"
+  site_description: "Lessons from Sheikh Ibn Uthaymeen's explanation of Imam An-Nawawi's Forty Hadith"
+  default_locale: ar
+  supported_locales: [ar, en, es, fr, id, ur]
 
-sleep: 1.0                    # Delay between API calls (seconds)
+sleep: 3.0

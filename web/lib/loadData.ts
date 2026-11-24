@@ -64,3 +64,11 @@ export async function countForType(contentType: string, locale?: string): Promis
   const items = await loadType(contentType, locale);
   return items.length;
 }
+
+export function loadSeo(id: string, locale: string): { title?: string; description?: string } {
+  const filename = path.join(DATA_DIR, "seo-meta.json");
+  try {
+    const meta = JSON.parse(fs.readFileSync(filename, "utf-8"))[id] || {};
+    return { title: meta[`title_${locale}`], description: meta[`description_${locale}`] };
+  } catch { return {}; }
+}

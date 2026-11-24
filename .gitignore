@@ -26,3 +26,8 @@ web/node_modules/
 
 # OS
 .DS_Store
+
+# Local configuration and test output
+config.yaml
+config.test.yaml
+data-test/

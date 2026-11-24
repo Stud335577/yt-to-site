@@ -7,13 +7,11 @@ import json
 import time
 from pathlib import Path
 
-import requests
-
 from ..config import PipelineConfig
+from ..groq_client import chat
 from ..storage import JSONLStore, ProgressTracker
 
 
-OPENROUTER_API = "https://openrouter.ai/api/v1/chat/completions"
 
 SEO_PROMPT = """Generate an SEO-optimized title and meta description for this content.
 
@@ -24,29 +22,14 @@ Language: {language}
 Return as JSON:
 {{"title": "SEO title (50-60 chars)", "description": "Meta description (150-160 chars)"}}
 
-Return ONLY the JSON, no other text."""
+Do not include Quran or hadith quotations or invent claims. Return ONLY the JSON, no other text."""
 
 
 def _generate_seo_meta(title: str, summary: str, language: str, model: str, api_key: str) -> dict:
     """Generate SEO title and description via LLM."""
     prompt = SEO_PROMPT.format(title=title, summary=summary or title, language=language)
 
-    response = requests.post(
-        OPENROUTER_API,
-        headers={
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-        },
-        json={
-            "model": model,
-            "messages": [{"role": "user", "content": prompt}],
-            "temperature": 0.3,
-            "max_tokens": 300,
-        },
-        timeout=60,
-    )
-    response.raise_for_status()
-    content = response.json()["choices"][0]["message"]["content"].strip()
+    content = chat([{"role": "user", "content": prompt}], model, api_key, max_tokens=300)
 
     # Parse JSON from response (handle markdown code blocks)
     if content.startswith("```"):
@@ -61,9 +44,9 @@ def run(config: PipelineConfig) -> dict:
     print("\n  SEO Meta")
     print("  " + "─" * 38)
 
-    api_key = os.getenv("OPENROUTER_API_KEY")
+    api_key = os.getenv("GROQ_API_KEY")
     if not api_key and not config.dry_run:
-        print("  Error: OPENROUTER_API_KEY required")
+        print("  Error: GROQ_API_KEY required")
         return {"error": "no API key"}
 
     store = JSONLStore(config.data_dir)
@@ -76,7 +59,8 @@ def run(config: PipelineConfig) -> dict:
             seo_data = json.load(f)
 
     total = 0
-    locales = config.translation.locales
+    errors = 0
+    locales = [config.channel.source_language] + [l for l in config.translation.locales if l != config.channel.source_language]
 
     for locale in locales:
         from .translate import LOCALE_NAMES
@@ -84,7 +68,7 @@ def run(config: PipelineConfig) -> dict:
         progress = ProgressTracker(config.data_dir, f"seo_{locale}")
 
         for content_type in config.content_types:
-            entries = store.read(content_type, locale=locale)
+            entries = store.read(content_type, locale=None if locale == config.channel.source_language else locale)
             pending = [e for e in entries if not progress.is_done(e["id"])]
             print(f"  {content_type} ({locale}): {len(pending)} pending")
 
@@ -114,9 +98,10 @@ def run(config: PipelineConfig) -> dict:
                         json.dump(seo_data, f, ensure_ascii=False, indent=2)
 
                 except Exception as e:
+                    errors += 1
                     print(f"    Error for {entry['id']}: {e}")
 
                 time.sleep(config.sleep)
 
     print(f"  Generated: {total} SEO entries")
-    return {"generated": total}
+    return {"generated": total, **({"error": f"{errors} SEO entries failed"} if errors else {})}
